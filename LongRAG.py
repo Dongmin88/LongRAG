@@ -104,60 +104,68 @@ class EnhancedRAG:
         """Generate response with intermediate reasoning"""
         # Format documents text
         docs_text = "\n\n".join([
-            f"Document {i+1}:\n{doc.content}" +
-            (" [Hard Negative]" if doc.is_hard_negative else "")
+            f"Document {i+1}:\n{doc.content}" 
             for i, doc in enumerate(documents)
         ])
 
-        # First prompt for reasoning
-        reasoning_prompt = f"""<|system|>You are a helpful AI assistant that first analyzes documents and then answers questions.</s>
-<|user|>I need help analyzing these documents to answer a question.
+        # Single prompt for entire generation
+        prompt = f"""<|system|>You are a helpful AI assistant. First analyze the documents to explain your reasoning, then provide a final answer.</s>
+    <|user|>Question: {query}
 
-Question: {query}
+    Documents:
+    {docs_text}
 
-Documents:
-{docs_text}
+    Please first explain your reasoning about the relevant information, then provide your final answer.</s>
+    <|assistant|>Let me analyze the relevant information:"""
 
-First, explain your reasoning about which documents are most relevant and why.</s>
-<|assistant|>Let me analyze the documents and explain my reasoning:</s>"""
-
-        # Generate reasoning
-        reasoning_inputs = self.llm_tokenizer(reasoning_prompt, return_tensors="pt").to(self.llm_model.device)
-        reasoning_outputs = self.llm_model.generate(
-            **reasoning_inputs,
-            max_new_tokens=200,
-            num_beams=4,
-            temperature=0.7,
-            top_p=0.9
-        )
-        reasoning = self.llm_tokenizer.decode(reasoning_outputs[0], skip_special_tokens=True)
-        reasoning = reasoning.split("Let me analyze")[-1].strip()
-
-        # Second prompt for final answer
-        answer_prompt = f"""<|system|>Now provide a final answer based on your analysis.</s>
-<|user|>Based on your analysis:
-{reasoning}
-
-Please provide a clear and concise answer to the original question: {query}</s>
-<|assistant|>Here's my answer based on the analysis:</s>"""
-
-        # Generate final answer
-        answer_inputs = self.llm_tokenizer(answer_prompt, return_tensors="pt").to(self.llm_model.device)
-        answer_outputs = self.llm_model.generate(
-            **answer_inputs,
-            max_new_tokens=150,
-            num_beams=4,
-            temperature=0.7,
-            top_p=0.9
-        )
-        
-        final_answer = self.llm_tokenizer.decode(answer_outputs[0], skip_special_tokens=True)
-        final_answer = final_answer.split("Here's my answer")[-1].strip()
-
-        return {
-            "reasoning": reasoning,
-            "answer": final_answer
-        }
+        try:
+            # Generate complete response
+            inputs = self.llm_tokenizer(prompt, return_tensors="pt").to(self.llm_model.device)
+            
+            outputs = self.llm_model.generate(
+                **inputs,
+                max_new_tokens=512,  # 토큰 수 증가
+                num_beams=4,
+                temperature=0.7,
+                top_p=0.9,
+                repetition_penalty=1.2,  # 반복 방지
+                no_repeat_ngram_size=3,  # n-gram 반복 방지
+                early_stopping=True,
+                pad_token_id=self.llm_tokenizer.eos_token_id
+            )
+            
+            full_response = self.llm_tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+            # Split response into reasoning and answer parts
+            response_parts = full_response.split("Let me analyze the relevant information:")[-1].strip()
+            
+            try:
+                # Try to find natural split between reasoning and answer
+                if "Final answer:" in response_parts.lower():
+                    reasoning, answer = response_parts.lower().split("final answer:", 1)
+                else:
+                    # Fallback: take last paragraph as answer
+                    paragraphs = response_parts.split("\n\n")
+                    reasoning = "\n\n".join(paragraphs[:-1])
+                    answer = paragraphs[-1]
+            
+                return {
+                    "reasoning": reasoning.strip(),
+                    "answer": answer.strip()
+                }
+                
+            except:
+                # If splitting fails, return entire response as answer
+                return {
+                    "reasoning": "Unable to separate reasoning from answer.",
+                    "answer": response_parts.strip()
+                }
+                
+        except Exception as e:
+            return {
+                "reasoning": f"Error during generation: {str(e)}",
+                "answer": "Failed to generate response."
+            }
 
     def process_query(self, query: str, corpus: List[str], k: int = 5) -> Dict[str, str]:
         """Complete RAG pipeline"""
@@ -199,7 +207,7 @@ def create_sample_database() -> List[str]:
 
 def main():
     # Hugging Face API 키 설정
-    API_KEY = "your_api_key_here"
+    API_KEY = "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"
     
     try:
         # RAG 시스템 초기화
