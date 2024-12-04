@@ -207,7 +207,7 @@ def create_sample_database() -> List[str]:
 
 def main():
     # Hugging Face API 키 설정
-    API_KEY = "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"
+    API_KEY = ""
     
     try:
         # RAG 시스템 초기화
