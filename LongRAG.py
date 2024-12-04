@@ -1,70 +1,66 @@
-import os
-from typing import List, Dict, Tuple
-import numpy as np
-from dataclasses import dataclass
 import torch
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
+from typing import List
+from dataclasses import dataclass
 
 @dataclass
 class Document:
     content: str
     score: float = 0.0
 
-class Config:
-    def __init__(self):
-        self.huggingface_token = os.getenv("HUGGINGFACE_TOKEN")
-        self.embedding_model = os.getenv("EMBEDDING_MODEL", "intfloat/e5-base")
-        self.llm_model = os.getenv("LLM_MODEL", "meta-llama/Llama-2-7b-chat-hf")
+class RAGSystem:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
         
-        if not self.huggingface_token:
-            raise ValueError("HUGGINGFACE_TOKEN not found in environment variables")
-
-class Retriever:
-    def __init__(self, config: Config):
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            config.embedding_model,
-            token=config.huggingface_token
+        # Initialize embedding model
+        self.embed_tokenizer = AutoTokenizer.from_pretrained(
+            "intfloat/e5-small", 
+            token=api_key
         )
-        self.model = AutoModel.from_pretrained(
-            config.embedding_model,
-            token=config.huggingface_token
+        self.embed_model = AutoModel.from_pretrained(
+            "intfloat/e5-small", 
+            token=api_key
         )
         
-    def _embed(self, texts: List[str]) -> torch.Tensor:
-        inputs = self.tokenizer(
-            texts, 
-            padding=True, 
-            truncation=True, 
-            max_length=512, 
+        # Initialize Llama 3.2 1B
+        self.llm_tokenizer = AutoTokenizer.from_pretrained(
+            "meta-llama/Llama-3.2-1B",
+            token=api_key
+        )
+        self.llm_model = AutoModelForCausalLM.from_pretrained(
+            "meta-llama/Llama-3.2-1B",
+            token=api_key,
+            device_map="auto",
+            torch_dtype=torch.float16
+        )
+    
+    def retrieve(self, query: str, corpus: List[str], k: int = 5) -> List[Document]:
+        inputs = self.embed_tokenizer(
+            [query] + corpus,
+            padding=True,
+            truncation=True,
+            max_length=512,
             return_tensors="pt"
         )
         
         with torch.no_grad():
-            outputs = self.model(**inputs)
-            embeddings = outputs.last_hidden_state[:, 0]
+            embeddings = self.embed_model(**inputs).last_hidden_state[:, 0]
             embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
             
-        return embeddings
+            query_emb = embeddings[0].unsqueeze(0)
+            doc_embs = embeddings[1:]
+            
+            similarities = torch.matmul(query_emb, doc_embs.T).squeeze()
+            top_k_scores, top_k_indices = torch.topk(similarities, min(k, len(corpus)))
+            
+            documents = [
+                Document(content=corpus[idx], score=score.item())
+                for idx, score in zip(top_k_indices, top_k_scores)
+            ]
+            
+            return self._reorder_documents(documents)
     
-    def retrieve(self, query: str, corpus: List[str], k: int = 5) -> List[Document]:
-        query_emb = self._embed([query])
-        doc_embs = self._embed(corpus)
-        
-        scores = torch.matmul(query_emb, doc_embs.T).squeeze()
-        top_k_scores, top_k_indices = torch.topk(scores, min(k, len(corpus)))
-        
-        return [
-            Document(content=corpus[idx], score=score.item())
-            for score, idx in zip(top_k_scores, top_k_indices)
-        ]
-
-class ReorderingStrategy:
-    @staticmethod
-    def reorder_documents(documents: List[Document]) -> List[Document]:
+    def _reorder_documents(self, documents: List[Document]) -> List[Document]:
         n = len(documents)
         reordered = [None] * n
         
@@ -76,85 +72,52 @@ class ReorderingStrategy:
             reordered[pos-1] = documents[i]
             
         return reordered
-
-class RAG:
-    def __init__(self, config: Config = None):
-        if config is None:
-            config = Config()
-            
-        self.config = config
-        self.retriever = Retriever(config)
-        
-        # Initialize LLM with Llama 2
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            "meta-llama/Llama-2-1b-chat-hf",  # Using 1B version
-            token=config.huggingface_token
-        )
-        self.model = AutoModelForCausalLM.from_pretrained(
-            "meta-llama/Llama-2-1b-chat-hf",  # Using 1B version
-            token=config.huggingface_token,
-            device_map="auto"  # Automatically handle device placement
-        )
-        
-        self.reorderer = ReorderingStrategy()
-        
-    def _create_prompt(self, query: str, documents: List[Document]) -> str:
-        # Llama 2 specific prompt format
+    
+    def generate_answer(self, query: str, documents: List[Document]) -> str:
         docs_text = "\n\n".join([
             f"Document {i+1}:\n{doc.content}" 
             for i, doc in enumerate(documents)
         ])
         
-        prompt = f"""[INST] Based on the following documents, please answer this question:
-{query}
+        # Llama 3 specific prompt format
+        prompt = f"""<|system|>You are a helpful AI assistant that answers questions based on provided documents.</s>
+<|user|>Answer this question using the documents below:
 
-Here are the relevant documents:
-{docs_text}
-[/INST]"""
+Question: {query}
+
+Documents:
+{docs_text}</s>
+<|assistant|>I'll help answer your question based on the provided documents.</s>"""
+
+        inputs = self.llm_tokenizer(prompt, return_tensors="pt").to(self.llm_model.device)
         
-        return prompt
-    
-    def generate(self, 
-                query: str,
-                corpus: List[str],
-                num_docs: int = 5,
-                max_new_tokens: int = 256) -> str:
-        
-        retrieved_docs = self.retriever.retrieve(query, corpus, k=num_docs)
-        reordered_docs = self.reorderer.reorder_documents(retrieved_docs)
-        prompt = self._create_prompt(query, reordered_docs)
-        
-        inputs = self.tokenizer(
-            prompt, 
-            return_tensors="pt", 
-            truncation=True,
-            max_length=2048
-        ).to(self.model.device)
-        
-        outputs = self.model.generate(
+        outputs = self.llm_model.generate(
             **inputs,
-            max_new_tokens=max_new_tokens,
+            max_new_tokens=256,
             num_beams=4,
             temperature=0.7,
-            no_repeat_ngram_size=3,
+            top_p=0.9,
+            repetition_penalty=1.2,
             early_stopping=True
         )
         
-        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        # Clean up response by removing the instruction part
-        response = response.split("[/INST]")[-1].strip()
-        return response
+        response = self.llm_tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # Extract assistant's response
+        return response.split("<|assistant|>")[-1].strip()
+    
+    def run_rag(self, query: str, corpus: List[str], k: int = 5) -> str:
+        retrieved_docs = self.retrieve(query, corpus, k)
+        answer = self.generate_answer(query, retrieved_docs)
+        return answer
 
 def main():
-    # Sample usage
+    # Your Hugging Face API key
+    API_KEY = "your_huggingface_api_key_here"
     
-    # First, set up your API key in a .env file:
-    # HUGGINGFACE_TOKEN=your_token_here
+    # Initialize RAG system
+    rag = RAGSystem(api_key=API_KEY)
     
-    # Initialize config
-    config = Config()
-    
-    # Sample corpus
+    # Example corpus
     corpus = [
         "The capital of France is Paris.",
         "Paris is known for the Eiffel Tower.",
@@ -163,17 +126,14 @@ def main():
         "French is the official language of France."
     ]
     
-    # Initialize RAG
-    rag = RAG(config)
-    
     # Example query
     query = "What is the capital of France and what is it known for?"
     
     try:
-        # Generate response
-        response = rag.generate(query, corpus)
-        print(f"Query: {query}")
-        print(f"Response: {response}")
+        answer = rag.run_rag(query, corpus)
+        print("Query:", query)
+        print("\nAnswer:", answer)
+        
     except Exception as e:
         print(f"Error occurred: {str(e)}")
 
