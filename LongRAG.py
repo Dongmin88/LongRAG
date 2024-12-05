@@ -217,7 +217,7 @@ def main():
         corpus = create_sample_database()
         
         # 테스트 쿼리
-        query = "How does AI relate to machine learning and deep learning?"
+        query = "What are the primary causes of global warming, and how do human activities contribute to it?"
         
         # 응답 생성
         response = rag.process_query(query, corpus, k=3)
